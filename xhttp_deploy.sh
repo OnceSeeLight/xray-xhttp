@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # ============================================================
 # 颜色与日志函数
@@ -23,11 +23,13 @@ fi
 show_menu() {
     echo ""
     echo "============================================"
-    echo "     Xray + Nginx + Certbot 管理脚本"
+    echo "     Xray 部署管理脚本（Nginx / Caddy 双模式）"
     echo "============================================"
     echo "  1) 安装并配置 (Nginx + Certbot + Xray)"
     echo "  2) 全部卸载 (清理所有组件与配置)"
     echo "  3) 查看当前 VLESS 链接"
+    echo "  4) 【推荐】Caddy 模式安装 Xray（没有 Caddy 会自动装）"
+    echo "  5) 卸载 Caddy 模式下的 Xray"
     echo "  0) 退出"
     echo "============================================"
 }
@@ -37,6 +39,13 @@ show_menu() {
 # ============================================================
 do_install() {
     step "开始安装"
+
+    # ---------- 端口冲突预检（避免 Nginx 与 Caddy 抢 80/443） ----------
+    if ss -lntp 2>/dev/null | grep -qE ':(80|443)[[:space:]].*caddy'; then
+        err "80/443 已被 Caddy 占用，Nginx 方案无法启动。"
+        err "请改用菜单 4（Caddy 模式），或先停止 Caddy（会导致现有站点中断）。"
+        return 1
+    fi
 
     step "[1/8] 安装 NGINX 与 Certbot"
     apt update
@@ -370,15 +379,370 @@ do_show_link() {
 }
 
 # ============================================================
+# 方案 A：在现有 Caddy 上叠加 Xray（XHTTP）
+#   特点：不装 Nginx，Caddy 缺失时自动安装；已有 Caddy 则只追加站点，
+#         不改动其现有配置，可在全新服务器上直接运行
+# ============================================================
+CADDY_FILE="${CADDY_FILE:-/etc/caddy/Caddyfile}"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_ENV="/root/xray_env.sh"
+REPO_RAW="https://raw.githubusercontent.com/OnceSeeLight/xray-xhttp/refs/heads/main"
+
+# ---------- 依赖准备：Caddy 不存在则自动安装 ----------
+caddy_ensure_installed() {
+    if command -v caddy >/dev/null 2>&1; then
+        log "Caddy 已安装：$(caddy version 2>/dev/null | head -n1)"
+        return 0
+    fi
+    warn "未检测到 Caddy，开始自动安装（官方 Cloudsmith 源）..."
+
+    apt update >/dev/null 2>&1 || true
+    for _pkg in curl gnupg; do
+        dpkg -s "$_pkg" >/dev/null 2>&1 || apt install -y "$_pkg" >/dev/null 2>&1 || true
+    done
+    command -v curl >/dev/null 2>&1 || { err "缺少 curl，无法安装 Caddy。"; return 1; }
+
+    apt install -y debian-keyring debian-archive-keyring apt-transport-https >/dev/null 2>&1 || true
+
+    if ! curl -1sLf -o /tmp/caddy.gpg.key \
+        'https://dl.cloudsmith.io/public/caddy/stable/gpg.key'; then
+        err "下载 Caddy GPG 公钥失败，请检查网络（或手动安装 Caddy 后重试）。"
+        return 1
+    fi
+    if command -v gpg >/dev/null 2>&1; then
+        gpg --batch --yes --dearmor \
+            -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+            /tmp/caddy.gpg.key 2>/dev/null || true
+    else
+        err "缺少 gnupg，无法导入 Caddy 公钥。"
+        return 1
+    fi
+    if [[ ! -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
+        err "Caddy 软件源公钥写入失败。"
+        return 1
+    fi
+
+    # 注意：Cloudsmith 官方的 debian.deb.txt 端点已失效(404)，
+    # 这里直接写入经过验证可用的源配置（dists/any-version/Release 可访问）
+    cat > /etc/apt/sources.list.d/caddy-stable.list <<'CADDYSRC'
+# Source: Caddy / stable (Cloudsmith)
+deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+CADDYSRC
+    if [[ ! -s /etc/apt/sources.list.d/caddy-stable.list ]]; then
+        err "写入 Caddy 软件源失败。"
+        return 1
+    fi
+
+    apt update || { err "apt update 失败。"; return 1; }
+    apt install -y caddy || { err "Caddy 安装失败。"; return 1; }
+    command -v caddy >/dev/null 2>&1 || { err "Caddy 安装后仍不可用。"; return 1; }
+    log "Caddy 安装完成：$(caddy version 2>/dev/null | head -n1)"
+}
+
+# ---------- 端口冲突预检（按实际监听者判断，不依赖进程名） ----------
+caddy_port_conflict() {
+    local holder
+    holder=$(ss -lntp 2>/dev/null | grep -E ':(80|443)[[:space:]]' | grep -v caddy | head -n1)
+    if [[ -n "$holder" ]]; then
+        warn "80/443 已有非 Caddy 进程监听，Caddy 将无法绑定："
+        echo "  $holder"
+        warn "请先停止占用端口的服务（如 nginx/apache）后重试。"
+        return 1
+    fi
+    return 0
+}
+
+# ---------- 确保有配置文件且服务在跑 ----------
+caddy_ensure_ready() {
+    if [[ ! -f "$CADDY_FILE" ]]; then
+        warn "未找到 $CADDY_FILE，创建空配置"
+        mkdir -p "$(dirname "$CADDY_FILE")"
+        printf '# Caddyfile\n' > "$CADDY_FILE"
+        [[ -s "$CADDY_FILE" ]] || { err "创建 $CADDY_FILE 失败。"; return 1; }
+    fi
+
+    systemctl enable caddy >/dev/null 2>&1 || true
+    if systemctl is-active --quiet caddy; then
+        log "Caddy 运行中，复用其 80/443 作为 TLS 前端"
+        return 0
+    fi
+
+    warn "Caddy 未运行，尝试启动..."
+    if systemctl start caddy; then
+        log "Caddy 已启动"
+    else
+        err "Caddy 启动失败，请查看：journalctl -u caddy -n 30"
+        return 1
+    fi
+}
+
+# ---------- 防火墙放行提示 ----------
+caddy_firewall_hint() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        ufw allow 80/tcp  >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+        log "已放行 ufw 80/443"
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-service=http  >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-service=https >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log "已放行 firewalld http/https"
+    fi
+}
+
+do_install_caddy() {
+    step "Caddy 模式：安装 Xray（Nginx 保持不动）"
+
+    step "[1/7] 前置检查（Caddy 缺失则自动安装）"
+    caddy_ensure_installed || return 1
+    caddy_port_conflict    || return 1
+    caddy_ensure_ready     || return 1
+    caddy_firewall_hint
+
+    step "[2/7] 检查 / 安装 Xray"
+    if [[ -x "$XRAY_BIN" ]]; then
+        log "Xray 已安装，跳过"
+    else
+        if [[ ! -f /tmp/xray-install.sh ]]; then
+            curl -fsSL -o /tmp/xray-install.sh \
+                https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
+                || { err "下载 Xray 安装脚本失败，请检查网络。"; return 1; }
+        fi
+        bash /tmp/xray-install.sh install || { err "Xray 安装失败。"; return 1; }
+        log "Xray 安装完成"
+    fi
+
+    step "[3/7] 准备伪装站页面"
+    mkdir -p /var/www/html
+    if [[ -s /var/www/html/index.html ]]; then
+        log "已存在 /var/www/html/index.html，保留"
+    elif wget -q -O /var/www/html/index.html "$REPO_RAW/index.html"; then
+        log "伪装页 index.html 已下载"
+    else
+        warn "伪装页下载失败，使用占位页"
+        printf '<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>It works</h1></body></html>\n' \
+            > /var/www/html/index.html
+    fi
+
+    step "[4/7] 域名与密钥参数"
+    local DOMAIN="${DOMAIN:-}"
+    if [[ -z "$DOMAIN" ]]; then
+        read -rp "请输入已解析到本机的域名 (例如 rock.example.com): " DOMAIN
+    fi
+    if [[ -z "$DOMAIN" ]]; then
+        err "域名不能为空。"
+        return 1
+    fi
+    local RESOLVED
+    RESOLVED=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
+    if [[ -z "$RESOLVED" ]]; then
+        warn "域名 $DOMAIN 目前无法解析；Caddy 会持续重试签发证书。"
+        warn "请确保 DNS A 记录已指向本机公网 IP。"
+    else
+        log "DNS 解析：$DOMAIN -> $RESOLVED"
+    fi
+
+    # 只提取 UUID / 路径复用，绝不能用 source 覆盖用户刚输入的域名
+    if [[ -f "$XRAY_ENV" ]]; then
+        local _old_uuid _old_rand
+        _old_uuid=$(sed -n 's/^export UUID="\(.*\)"$/\1/p' "$XRAY_ENV" | head -n1)
+        _old_rand=$(sed -n 's/^export RANDOM_STR="\(.*\)"$/\1/p' "$XRAY_ENV" | head -n1)
+        if [[ -z "${UUID:-}" && -n "$_old_uuid" ]]; then
+            UUID="$_old_uuid"
+            log "复用现有 UUID：$UUID"
+        fi
+        if [[ -z "${RANDOM_STR:-}" && -n "$_old_rand" ]]; then
+            RANDOM_STR="$_old_rand"
+            log "复用现有路径：/api/$RANDOM_STR"
+        fi
+    fi
+    if [[ -z "${UUID:-}" ]]; then
+        UUID=$("$XRAY_BIN" uuid)
+    fi
+    if [[ -z "${RANDOM_STR:-}" ]]; then
+        RANDOM_STR=$(set +o pipefail; tr -dc 'a-z' < /dev/urandom | head -c 6)
+    fi
+    if [[ ${#RANDOM_STR} -ne 6 ]]; then
+        err "随机路径生成失败，请重试。"
+        return 1
+    fi
+    log "UUID       : $UUID"
+    log "XHTTP 路径 : /api/$RANDOM_STR"
+
+    step "[5/7] 写入 Xray 配置并启动"
+    mkdir -p "$(dirname "$XRAY_CONFIG")" /var/log/xray
+    if ! curl -fsSL -o /tmp/xray_cfg_tpl.json "$REPO_RAW/config.json"; then
+        err "下载 Xray 配置模板失败，请检查网络。"
+        return 1
+    fi
+    if ! python3 - "$UUID" "/api/$RANDOM_STR" <<'PY'
+import json, sys
+uuid, path = sys.argv[1], sys.argv[2]
+d = json.load(open('/tmp/xray_cfg_tpl.json'))
+ib = d['inbounds'][0]
+ib['port'] = 8080
+ib['listen'] = '127.0.0.1'
+ib['settings']['clients'][0]['id'] = uuid
+ib['streamSettings']['xhttpSettings']['path'] = path
+d['log'] = {'loglevel': 'warning', 'access': 'none', 'error': '/var/log/xray/error.log'}
+with open('/usr/local/etc/xray/config.json', 'w') as f:
+    json.dump(d, f, indent=2)
+PY
+    then
+        err "生成 Xray 配置失败。"
+        return 1
+    fi
+    log "配置已写入：$XRAY_CONFIG"
+
+    if ! "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/tmp/xray_test.log 2>&1; then
+        err "Xray 配置校验失败："
+        cat /tmp/xray_test.log
+        return 1
+    fi
+    log "Xray 配置校验通过"
+
+    chown -R xray:xray /var/log/xray 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable xray >/dev/null 2>&1 || true
+    if ! systemctl restart xray; then
+        err "Xray 启动失败，请查看：journalctl -u xray -n 30"
+        return 1
+    fi
+    sleep 1
+    if ! systemctl is-active --quiet xray; then
+        err "Xray 未处于运行状态，请查看：journalctl -u xray -n 30"
+        return 1
+    fi
+    log "Xray 已启动，监听 127.0.0.1:8080"
+
+    cat > "$XRAY_ENV" <<EOF
+export UUID="$UUID"
+export DOMAIN="$DOMAIN"
+export RANDOM_STR="$RANDOM_STR"
+export MODE="caddy"
+EOF
+    chmod 600 "$XRAY_ENV"
+    log "变量已保存：$XRAY_ENV"
+
+    step "[6/7] 写入 Caddy 配置（只新增，不改动已有站点）"
+    cp -a "$CADDY_FILE" "${CADDY_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    awk -v d="$DOMAIN" '
+        $0 ~ "^# ==== Xray XHTTP \\(" { next }
+        $0 ~ "^[[:space:]]*" d "[[:space:]]*\\{" { skip=1 }
+        skip && /^\}/ { skip=0; next }
+        !skip { print }
+    ' "$CADDY_FILE" > /tmp/Caddyfile.new || { err "解析 Caddyfile 失败。"; return 1; }
+    printf '\n# ==== Xray XHTTP (%s) ====\n' "$DOMAIN" >> /tmp/Caddyfile.new
+    cat >> /tmp/Caddyfile.new <<EOF
+$DOMAIN {
+    root * /var/www/html
+    file_server
+
+    @xhttp path /api/$RANDOM_STR*
+    reverse_proxy @xhttp 127.0.0.1:8080 {
+        flush_interval -1
+    }
+
+    log {
+        output discard
+    }
+}
+EOF
+
+    if ! caddy validate --config /tmp/Caddyfile.new --adapter caddyfile >/tmp/caddy_val.log 2>&1; then
+        err "Caddy 配置校验失败，未做任何改动："
+        tail -5 /tmp/caddy_val.log
+        return 1
+    fi
+    log "Caddy 配置校验通过"
+    cp /tmp/Caddyfile.new "$CADDY_FILE"
+
+    if systemctl reload caddy; then
+        log "Caddy 已平滑重载（现有站点未中断）"
+    else
+        warn "Caddy 重载失败，可用备份回滚：ls -l ${CADDY_FILE}.bak.*"
+    fi
+
+    step "[7/7] 安装完成"
+    echo "域名      : $DOMAIN"
+    echo "UUID      : $UUID"
+    echo "XHTTP 路径: /api/$RANDOM_STR"
+    echo "本地监听  : 127.0.0.1:8080"
+    echo "变量文件  : $XRAY_ENV"
+    echo "--------------------------------------------"
+    do_show_link
+}
+
+# ============================================================
+# 卸载：仅移除 Caddy 模式下的 Xray 及站点块
+# ============================================================
+do_uninstall_caddy() {
+    step "卸载 Caddy 模式下的 Xray"
+    read -rp "确认卸载？(输入 yes 继续): " CONFIRM
+    if [[ "$CONFIRM" != "yes" ]]; then
+        warn "已取消。"
+        return 0
+    fi
+
+    local DOMAIN=""
+    if [[ -f "$XRAY_ENV" ]]; then
+        # shellcheck disable=SC1090
+        source "$XRAY_ENV"
+    fi
+    [[ -z "${DOMAIN:-}" ]] && read -rp "请输入要移除的域名: " DOMAIN
+
+    step "[1/4] 停止并移除 Xray"
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    if command -v xray >/dev/null 2>&1 && [[ -f /tmp/xray-install.sh ]]; then
+        bash /tmp/xray-install.sh remove --purge || true
+    fi
+    log "Xray 已移除"
+
+    step "[2/4] 从 Caddyfile 移除站点块"
+    if [[ -n "$DOMAIN" && -f "$CADDY_FILE" ]]; then
+        cp -a "$CADDY_FILE" "${CADDY_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+        awk -v d="$DOMAIN" '
+            $0 ~ "^# ==== Xray XHTTP \\(" { next }
+            $0 ~ "^[[:space:]]*" d "[[:space:]]*\\{" { skip=1 }
+            skip && /^\}/ { skip=0; next }
+            !skip { print }
+        ' "$CADDY_FILE" > /tmp/Caddyfile.new || { err "解析 Caddyfile 失败。"; return 1; }
+        if ! command -v caddy >/dev/null 2>&1; then
+            warn "未安装 Caddy，直接覆盖配置文件"
+            cp /tmp/Caddyfile.new "$CADDY_FILE"
+        elif caddy validate --config /tmp/Caddyfile.new --adapter caddyfile >/dev/null 2>&1; then
+            cp /tmp/Caddyfile.new "$CADDY_FILE"
+            systemctl reload caddy && log "Caddy 已重载，站点块已移除"
+        else
+            err "移除后配置校验失败，已保留原 Caddyfile，请手动检查。"
+        fi
+    else
+        warn "未获取到域名，跳过 Caddyfile 清理。"
+    fi
+
+    step "[3/4] 清理文件"
+    rm -f "$XRAY_ENV" /root/vless_link.txt
+    log "变量文件已清理"
+
+    step "[4/4] 完成"
+    echo "如需彻底清理，可另行删除 /var/www/html/index.html"
+}
+
+# ============================================================
 # 主循环
 # ============================================================
 while true; do
     show_menu
-    read -rp "请选择 [0-3]: " CHOICE
+    read -rp "请选择 [0-5]: " CHOICE
     case "$CHOICE" in
-        1) do_install ;;
+        1) do_install || warn "安装未完成，已返回主菜单。" ;;
         2) do_uninstall ;;
         3) do_show_link ;;
+        4) do_install_caddy || warn "Caddy 模式安装未完成，已返回主菜单。" ;;
+        5) do_uninstall_caddy ;;
         0) log "退出。"; exit 0 ;;
         *) warn "无效选项，请重新输入。" ;;
     esac
