@@ -30,6 +30,7 @@ show_menu() {
     echo "  3) 查看当前 VLESS 链接"
     echo "  4) 【推荐】Caddy 模式安装 Xray（没有 Caddy 会自动装）"
     echo "  5) 卸载 Caddy 模式下的 Xray"
+    echo "  6) 【BBR】开启 BBR + fq 拥塞控制"
     echo "  0) 退出"
     echo "============================================"
 }
@@ -734,15 +735,50 @@ do_uninstall_caddy() {
 # ============================================================
 # 主循环
 # ============================================================
+# ============================================================
+# 开启 BBR + fq 拥塞控制（菜单 6 / 命令行 --bbr）
+# ============================================================
+do_enable_bbr() {
+    step "开启 BBR + fq"
+
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        err "当前内核不支持 BBR（需要 4.9+ 内核并可加载 tcp_bbr 模块）。"
+        return 1
+    fi
+
+    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    if ! sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null; then
+        err "sysctl 应用失败，请检查 /etc/sysctl.d/99-bbr.conf"
+        return 1
+    fi
+
+    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+    log "BBR + fq 已开启（已写入 /etc/sysctl.d/99-bbr.conf，重启后保持）"
+}
+
+# 命令行参数：./xhttp_deploy.sh --bbr 直接开启后退出
+if [[ "${1:-}" == "--bbr" ]]; then
+    do_enable_bbr
+    exit $?
+fi
+
 while true; do
     show_menu
-    read -rp "请选择 [0-5]: " CHOICE
+    read -rp "请选择 [0-6]: " CHOICE
     case "$CHOICE" in
         1) do_install || warn "安装未完成，已返回主菜单。" ;;
         2) do_uninstall ;;
         3) do_show_link ;;
         4) do_install_caddy || warn "Caddy 模式安装未完成，已返回主菜单。" ;;
         5) do_uninstall_caddy ;;
+        6) do_enable_bbr || warn "BBR 开启失败。" ;;
         0) log "退出。"; exit 0 ;;
         *) warn "无效选项，请重新输入。" ;;
     esac
